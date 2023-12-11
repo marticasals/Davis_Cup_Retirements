@@ -1,0 +1,561 @@
+---
+title: "Tennis davis Cup"
+author: "Martí Casals & Jordi Cortes"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 10, fig.height = 7)
+data_file <- '../Data/data_2023-03-30.Rdata'
+```
+
+## Introduction
+
+### Data
+
+The clean database is in the file: 
+
+- __*`r data_file`*__.
+
+
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+library(forcats)
+library(compareGroups)
+library(psych)
+library(car)
+library(summarytools)
+library(party)
+library(emmeans)
+library(multcomp)
+library(effects)
+library(AER)
+library(knitr)
+library(epiR)
+library(SmartEDA)
+library(data.table)
+library(epitools)
+library(patchwork) 
+
+load(data_file)
+dades <- dades_R; rm(dades_R)
+n_WO  <- sum(dades$sum_score==0) # Walk Overs
+```
+
+### Additional debugging
+
+- **Walk overs** (n = `r n_WO`) are removed.
+- The average age variable of the players is constructed
+- Fixed some factors
+
+
+```{r}
+##-- Mean age
+dades$mean_age     <- dades$sum_age/2
+dades$mean_age_cat <- round(dades$mean_age)
+
+##-- Retirement as numeric
+dades$Retirement_num <- as.numeric(dades$Retirement) - 1
+
+##-- Arrange categorical variables
+dades$best_of      <- factor(ifelse(dades$best_of=='5 sets','5sets','3sets'))
+dades$round_cat    <- factor(ifelse(dades$round %in% c("QF","SF","F"),
+                                    "Final","Preliminar"),
+                             levels=c('Preliminar','Final'))
+dades$mean_age_ind <- factor(ifelse(dades$mean_age>=27,">27","<27"))
+dades$year_cat     <- factor(ifelse(dades$year<2010,"<2010",">=2010"),
+                             levels=c('<2010','>=2010'))
+dades$year_center  <- dades$year - median(dades$year)
+
+##-- Remove walk overs (n=11)
+dades$WO <- dades$sum_score==0
+n_WO     <- sum(dades$WO)
+dades    <- dades %>% filter(!WO)
+```
+
+First registers of data.
+
+```{r}
+head(dades,3)
+```
+
+
+# Descriptive analysis
+
+## Covariates
+
+```{r results='asis', message=FALSE, warning=FALSE}
+VAR_ADJUST <- c('surface','best_of','group','year','sum_age','dif_age','match_num')
+dfSummary(dades[,VAR_ADJUST], 
+          style        = "grid",
+          plain.ascii  = FALSE,
+          graph.magnif = 0.75, 
+          tmp.img.dir  = "./tmp")
+```
+
+## Retirements
+
+```{r}
+p_ret <- prop.table(table(dades$Retirement))[2]
+```
+
+The proportion of withdrawals in our sample is `r round(p_ret,3)`. That is, `r 100*round(p_ret,3)`%. 
+
+```{r}
+knitr::kable(as.data.frame(table(dades$Retirement)),
+      col.names= c("Retirements", "Number"),
+      align= "cc")
+```
+
+Retirements by group:
+
+```{r}
+with(dades,table(group,Retirement))
+```
+
+## Bivariate descriptive analysis
+
+```{r warning=FALSE}
+dades$surface <- relevel(dades$surface,ref="Carpet")
+dades$group   <- relevel(dades$group,  ref="No Mundial 1")
+dades$round   <- factor(dades$round, 
+                        levels=c('PO','GS','SR','R1','R2','R3','QF','SF','F'))
+
+
+res2  <- compareGroups(Retirement~surface+best_of+group+round_cat+match_num+sum_score+mean_age,
+                       data=dades,byrow = TRUE)
+summary(res2)
+restab1 <- createTable(res2,show.n=TRUE,show.ratio=TRUE,type=2)
+restab1 <- createTable(res2,show.n=FALSE,show.ratio=FALSE,show.p.overall = FALSE,type=2)
+restab1
+export2word(restab1,file = "Table1.docx")
+```
+
+```{r warning=FALSE}
+#### Incidence per 1000 games
+dd <- as.data.table(dades)[,.(retirements=sum(Retirement=='Yes'),games=sum(sum_score)),by=year]
+pe <-pois.exact(x = dd$retirements,pt = dd$games)
+
+per_param <- 1000
+dd$incidence     <- per_param*pe[,'rate']
+dd$incidence_low <- per_param*pe[,'lower']
+dd$incidence_upp <- per_param*pe[,'upper']
+
+ggplot(dd,aes(x=year,y=incidence)) + 
+  geom_line (linewidth=1, col='darkblue') +
+  geom_point(col='darkblue', size=3) +
+  ylim(0,max(dd$incidence)) +
+  xlim(2000,2020) +
+  labs(x="Year", 
+       y="Retirement Incidence Rate per 1,000 games",
+       title="Davis Cup Incidence of Retirements by year") +
+  theme(axis.title = element_text(face = 'bold'),
+        axis.text  = element_text(face = 'bold'))
+
+inc_rate_game_overall <- 1000*sum(dd$retirements)/sum(dd$games)
+inc_rate_game_overall_per_1 <- pois.exact(x = sum(dd$retirements),pt = sum(dd$games))
+inc_rate_game_overall_per_1000 <- inc_rate_game_overall_per_1
+inc_rate_game_overall_per_1000[3:5] <- 1000*inc_rate_game_overall_per_1000[3:5]
+inc_rate_game_overall_per_1000
+
+#### Epidemiological measures
+
+# Option 1:  Base R - tapply for SUM of people who RETIRED by SURFACE and the SUM of FOLLOW-UP TIME by SURFACE 
+events <- tapply(dades$Retirement=="Yes", dades$surface, sum) 
+persontime <- tapply(dades$sum_score, dades$surface, sum)
+# make a 2 by 2 table, remembering to make the unexposed group the 2nd row 
+tab_surface <- cbind(events, persontime) 
+tab_surface <- tab_surface[c(2,1),]
+epi.2by2(tab_surface, method = "cohort.time")
+
+# Option 2: Via Tydiverse
+retirement_rate <- dades %>% 
+  group_by(surface) %>% 
+  summarise(events =  sum(Retirement=="Yes"),time = sum(sum_score)) %>% 
+  dplyr::select(-c(1)) %>% 
+  as.matrix
+retirement_rate <- retirement_rate[c(2,1),]
+epi.2by2(retirement_rate, method = "cohort.time")
+
+
+# Option 3: Manual
+
+# SURFACE (GAMES) --------------------------------------------------------------
+
+# Comparing `surface` vs. `Retirement`
+ExpCustomStat(dades,Cvar=c("surface","Retirement"),gpby=TRUE,filt=NULL)
+(retSurface<-table(dades$Retirement, dades$surface))
+
+totalgamesSurface<-aggregate(sum_score~surface, data = dades, sum)
+totalgamesSurface
+
+# Comparing Clay vs. Carpet
+Clay_Carpet<-c(67,67669,10,19685)
+epi.2by2(dat = Clay_Carpet, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+# Comparing Grass vs. Carpet 
+Grass_Carpet<-c(6,5494,10,19685)
+epi.2by2(dat = Grass_Carpet, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+# Comparing Hard vs. Carpet
+Hard_Carpet<-c(108,88566,10,19685)
+epi.2by2(dat = Hard_Carpet, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+# BEST OF (GAMES) --------------------------------------------------------------
+
+# Comparing `surface` vs. `Retirement`
+ExpCustomStat(dades,Cvar=c("best_of","Retirement"),gpby=TRUE,filt=NULL)
+(retBestof<-table(dades$Retirement, dades$best_of))
+
+totalgamesBestof<-aggregate(sum_score~best_of, data = dades, sum)
+totalgamesBestof
+
+# Comparing 5 sets vs. 3 sets
+Fivesets_Threesets<-c(165,140028,26,41386)
+epi.2by2(dat = Fivesets_Threesets, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+# GROUP (GAMES) ----------------------------------------------------------------
+
+# Comparing `surface` vs. `Retirement`
+ExpCustomStat(dades,Cvar=c("group","Retirement"),gpby=TRUE,filt=NULL)
+(retgroup<-table(dades$Retirement, dades$group))
+
+totalgamesgroup<-aggregate(sum_score~group, data = dades, sum)
+totalgamesgroup
+
+# Comparing No Mundial 1 vs. Mundial1
+NoMundial1_Mundial1<-c(143,124970,48,56444)
+epi.2by2(dat = NoMundial1_Mundial1, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+# ROUND (GAMES) ----------------------------------------------------------------
+
+# Comparing `Round` vs. `Retirement`
+ExpCustomStat(dades,Cvar=c("round_cat","Retirement"),gpby=TRUE,filt=NULL)
+(retRound<-table(dades$Retirement, dades$round_cat))
+
+totalgamesRound<-aggregate(sum_score~round_cat, data = dades, sum)
+totalgamesRound
+
+# Comparing Preliminar vs. Final
+Preliminar_Final<-c(160,149780,31,31634)
+epi.2by2(dat = Preliminar_Final, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+
+# MATCH NUM (GAMES) ------------------------------------------------------------
+
+# Comparing `Match Num` vs. `Retirement`
+ExpCustomStat(dades,Cvar=c("match_num","Retirement"),gpby=TRUE,filt=NULL)
+(retMatx<-table(dades$Retirement, dades$match_num))
+
+totalgamesMatx<-aggregate(sum_score~match_num, data = dades, sum)
+totalgamesMatx
+
+# Comparing 2nd vs. 1st
+Segon_Primer<-c(45,52472,38,51755)
+epi.2by2(dat = Segon_Primer, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+# Comparing 3rd vs. 1st
+Tercer_Primer<-c(57,44041,38,51755)
+epi.2by2(dat = Tercer_Primer, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+
+# Comparing 4th vs. 1st
+Quart_Primer<-c(51,33146,38,51755)
+epi.2by2(dat = Quart_Primer, method = "cohort.time", digits = 2,
+conf.level = 0.95, units = 1000, interpret = FALSE, outcome = "as.columns")
+```
+
+## Interactions
+
+We study interactions by a decision tree.
+
+```{r fig.width=11}
+d <- dades
+ct <- party::ctree(Retirement~surface+best_of+year+dif_age+match_num+round,
+            data = d, controls=party::ctree_control(maxdepth=3))
+plot(ct)
+```
+
+## Lineality
+
+### Age
+
+Age is not linear as can be seen in the following figures.
+
+```{r}
+#-- Count response
+f_rate          <- function(x,lab='Yes') sum(x==lab)/sum(!is.na(x))
+t_log_age_rate  <- log(tapply(d$Retirement,d$mean_age_cat,f_rate)+.1)
+rate            <- as.numeric(t_log_age_rate)
+age             <- as.numeric(names(t_log_age_rate))
+
+plot(age,rate,xlab="mean age (years)",ylab="rate",las=1,main="Count data")
+lines(lowess(rate~age), col=4,lwd=2)
+```
+
+```{r}
+##-- Binary response
+t_age       <- table(d$mean_age_cat,d$Retirement)
+log_odd_age <- log((t_age[,2]+.5) / (t_age[,1]+.5))
+age         <- as.numeric(rownames(t_age))
+
+plot(age,log_odd_age,xlab="mean age (years)",ylab="logodd",las=1, main="Binay data")
+lines(lowess(log_odd_age~age), col=4,lwd=2)
+```
+
+### Year
+
+```{r}
+##-- Count response
+t_log_year_rate  <- log(tapply(d$Retirement,d$year,f_rate)+.1)
+rate             <- as.numeric(t_log_year_rate)
+year             <- as.numeric(names(t_log_year_rate))
+
+plot(year,rate,xlab="calendar year",ylab="rate",las=1,main="Count data")
+lines(lowess(rate~year), col=4,lwd=2)
+```
+
+```{r}
+##-- Binary response
+t_year       <- table(d$year,d$Retirement)
+log_odd_year <- log((t_year[,2]+.5) / (t_year[,1]+.5))
+year         <- as.numeric(rownames(t_year))
+
+plot(year,log_odd_year,xlab="mean age (years)",ylab="logodd",las=1, main="Binay data")
+lines(lowess(log_odd_year~year), col=4, lwd=2)
+```
+
+# Models
+
+## Count data model 
+
+- The logarithm of the number of games is included as offset
+- The year is included centered and as a quadratic polynomial
+- Two slopes are included for middle age (before and after 27 years)
+
+ANOVA (Type II) of the first additive model:
+
+```{r}
+dd <- dades
+
+# Model 0: additive model
+model0 <- glm(Retirement_num ~ surface + best_of + year_center + I(year_center^2) +
+                               mean_age*mean_age_ind + match_num + round_cat + group, 
+              offset=log(sum_score), family = "poisson", data = dd)
+Anova(model0)
+```
+
+Overdispersion? No
+
+```{r}
+dispersiontest(model0,trafo=1)
+dispersiontest(model0,trafo=2)
+```
+Interactions are proposed and a stepwise is made to find a better model according 
+to the BIC criterion and then surface and the interaction with age are added.
+
+```{r}
+# BIC + surface and mean_age
+model4 <- glm(Retirement_num ~ surface + 
+                mean_age*mean_age_ind + 
+                best_of*match_num,
+              offset=log(sum_score),family = "poisson",data = dd)
+summary(model4) 
+
+model_count <- model4
+```
+
+### Best model according BIC adding surface and interaction with age
+
+Final model:
+
+```{r}
+summary(model_count)
+```
+
+```{r}
+plot(allEffects(model_count))
+```
+
+### Forest plot
+
+Next figure shows the incidence Rate Ratio for the different factors in study. 
+
+Regarding the **surfaces**, the rate of retirements in Clay, Hard or Grass 
+is more than double than in the carpet surface, being the two formers 
+statistically significant.
+
+The behavior of retirements is different depending on the **age** of participants. 
+If they are younger (mean age below 27), then the incidence rate (IR) of retirements 
+is the half for a 5 years increase. Meanwhile, if the mean age of the players is
+at least 27 years, then the IR doubles for 5 years increase, but not statistical
+significantly.
+
+Finally, the **number of individual match** also plays a role in the retirements but
+it depends on the number of sets for the eliminatory:
+- If the matches are at best of 3 sets, retirements are less usual in 3rd and 4th matches.
+- Oppositely, if the matches are at best of 5 sets, retirements are more prone to be produced in 3rd and 4th matches.
+
+
+```{r}
+LH <- list(as.numeric(confint(glht(model_count, "surfaceClay  = 0"))$confint),
+           as.numeric(confint(glht(model_count, "surfaceGrass = 0"))$confint),                
+           as.numeric(confint(glht(model_count, "surfaceHard  = 0"))$confint),
+           as.numeric(confint(glht(model_count, "5*mean_age   = 0"))$confint),
+           as.numeric(confint(glht(model_count, t(c(rep(0,4),5,rep(0,5),5,rep(0,3)))))$confint), 
+           as.numeric(confint(glht(model_count, "match_num2 = 0"))$confint),                  
+           as.numeric(confint(glht(model_count, "match_num3 = 0"))$confint), 
+           as.numeric(confint(glht(model_count, "match_num4 = 0"))$confint),
+           as.numeric(confint(glht(model_count, "match_num2 + best_of5sets:match_num2 = 0"))$confint),    
+           as.numeric(confint(glht(model_count, "match_num3 + best_of5sets:match_num3 = 0"))$confint),
+           as.numeric(confint(glht(model_count, "match_num4 + best_of5sets:match_num4 = 0"))$confint))  
+IRR <- as.data.frame(matrix(exp(unlist(LH)),ncol=3,byrow = TRUE))
+names(IRR) <- c('IRR','LL_CI','UL_CI')
+IRR$model<- factor(1:nrow(IRR),levels=1:nrow(IRR))
+LABS <- data.frame(model= factor(1:(nrow(IRR)+1),levels=(1:(nrow(IRR)+1))),
+                   lab1 = c('Subgroup',
+                            NA,'All',NA,'Mean age < 27','Mean age >= 27',
+                            NA,'Best of 3',NA,NA,'Best of 5',NA),
+                   lab2 = c('Comparison',
+                            'surface: Clay vs. Carpet','surface: Grass vs. Carpet','surface: Hard vs. Carpet',
+                            'age: +5 years','age: +5 years',
+                            'match no.: 2 vs. 1','match no.: 3 vs. 1','match no.: 4 vs. 1',
+                            'match no.: 2 vs. 1','match no.: 3 vs. 1','match no.: 4 vs. 1'),
+                   lab3 = c('IRR',
+                            paste0(formatC(IRR$IRR,   format = 'f', digits=2),' (',
+                                   formatC(IRR$LL_CI, format = 'f', digits=2),' , ',
+                                   formatC(IRR$UL_CI, format = 'f', digits=2),')')))
+
+##-- Middel plot ---------------------------------------------------------------
+gg_mid <- ggplot(IRR,aes(y=fct_rev(model))) +
+  geom_point(aes(x=IRR), shape=15, size=4, color='darkblue') +
+  geom_linerange(aes(xmin=LL_CI, xmax=UL_CI), color='darkblue', linewidth = 1.2) +
+  geom_vline(xintercept = 1) +
+  geom_vline(xintercept = c(0.1,0.2,0.5,2,5,10), linetype="dashed") +
+  geom_hline(yintercept = c(3.5,6.5,8.5), linetype=3) +
+  labs(x="Incidence Rate Ratio (IRR)", y="") +
+  scale_x_log10(limits=c(0.025,40), breaks= c(0.1,0.2,0.5,2,5,10)) +
+  coord_cartesian(ylim=c(1,12), xlim=c(0.1,10)) +
+  theme_classic() +
+  theme(axis.line.y  = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_blank(),
+        axis.title.y = element_blank())
+##-- Left plot -----------------------------------------------------------------
+gg_left <- ggplot(LABS,aes(y=fct_rev(model))) +
+  geom_text(aes(x = 0, label = lab1),
+            hjust = 0, size=3.3,
+            fontface = if_else(LABS$lab1==LABS$lab1[1],"bold","plain")) +
+  geom_text(aes(x = 1.3, label = lab2),
+            hjust = 0, size=if_else(LABS$lab2==LABS$lab2[1],3.5,3),
+            fontface = if_else(LABS$lab2==LABS$lab2[1],"bold","plain")) +
+  coord_cartesian(xlim = c(0, 2.5), ylim = c(1,12)) + 
+  theme_void()
+##-- Right plot ----------------------------------------------------------------
+gg_right <- ggplot(LABS,aes(y=fct_rev(model))) +
+  geom_text(aes(x = 1, label = lab3),
+            hjust = 0.5, size=if_else(LABS$lab3==LABS$lab3[1],3.5,3),
+            fontface = if_else(LABS$lab3==LABS$lab3[1],"bold","plain")) +
+  coord_cartesian(xlim = c(0, 2), ylim = c(1,12)) + 
+  theme_void()
+
+layout <- c(
+  area(t = 0, l = 0, b = 30, r = 5), 
+  area(t = 1, l = 6, b = 30, r = 10),
+  area(t = 0, l = 11, b = 30, r = 12))
+
+gg_left + gg_mid + gg_right + plot_layout(design = layout)
+```
+
+
+## Logistic Models
+
+### Fitting
+
+The same variables are put in as in counts and the following model is obtained that will be used to calculate the probabilities of withdrawals.
+
+```{r}
+# Model 0
+form <- model_count$formula
+model0 <- glm(form,family = "binomial",data = dd)
+model_bin <- model0
+summary(model_bin)
+```
+
+### Validation
+
+Residuals validate the model.
+
+```{r}
+residualPlot(model_bin)
+```
+
+### Interpretation
+
+The following plot shows all the effects:
+
+```{r}
+plot(allEffects(model_bin))
+```
+
+### Probabilities
+
+We use the emmeans package to understand the effects. 
+
+```{r}
+emm_surface <- emmeans(model_bin,~surface,              type='response')
+emm_age1    <- emmeans(model_bin,~mean_age|mean_age_ind,
+                       at=list(mean_age=seq(18,26,2)),  type='response')
+emm_age2    <- emmeans(model_bin,~mean_age|mean_age_ind,
+                       at=list(mean_age=seq(28,36,2)),  type='response')
+emm_match   <- emmeans(model_bin,~match_num|best_of,    type='response')
+
+s_surface <- summary(emm_surface)
+s_age1    <- summary(emm_age1)
+s_age2    <- summary(emm_age2)
+s_match   <- summary(emm_match)
+
+d_emm <- data.frame(Variable = c(rep('Surface',4),
+                                 rep('Age',10),
+                                 rep('Match no.',8)),
+                    Subgroup = c(rep('All',4),
+                                 rep('Age <  27',5),
+                                 rep('Age >= 27',5),
+                                 rep('Best of 3 sets',4),
+                                 rep('Best of 5 sets',4)),
+                    Category = c(as.character(s_surface$surface),
+                                 s_age1$mean_age[1:5],
+                                 s_age2$mean_age[1:5],
+                                 s_match$match_num),
+                    prob     = c(s_surface$prob,
+                                 s_age1$prob[1:5],
+                                 s_age2$prob[6:10],
+                                 s_match$prob[1:4],
+                                 s_match$prob[5:8]),
+                    lower    = c(s_surface$asymp.LCL,
+                                 s_age1$asymp.LCL[1:5],
+                                 s_age2$asymp.LCL[6:10],
+                                 s_match$asymp.LCL[1:4],
+                                 s_match$asymp.LCL[5:8]),
+                    upper    = c(s_surface$asymp.UCL,
+                                 s_age1$asymp.UCL[1:5],
+                                 s_age2$asymp.UCL[6:10],
+                                 s_match$asymp.UCL[1:4],
+                                 s_match$asymp.UCL[5:8]))
+
+kable(d_emm, digits=3)
+```
+
+
